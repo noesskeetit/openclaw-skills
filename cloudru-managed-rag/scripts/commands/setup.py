@@ -666,13 +666,11 @@ def step_ensure_bucket(ctx: PipelineContext) -> Dict[str, Any]:
         )
 
     # Create bucket via BFF s3e-controller (registers in platform)
-    # Match UI payload: global_name, domain_name, quotas, log_group_id
+    # Match UI payload exactly — no global_name/domain_name, quota=0
     bucket_body = {
         "name": bucket_name,
-        "global_name": bucket_name,
-        "domain_name": bucket_name,
         "storage_class": "STANDARD",
-        "quotas": [{"type": "BUCKET_SIZE", "value": 10, "unit": "GB"}],
+        "quotas": [{"type": "BUCKET_SIZE", "value": 0, "unit": "GB"}],
     }
     status, data = _bff_request(
         "POST",
@@ -905,6 +903,52 @@ def step_upload_docs(ctx: PipelineContext) -> Dict[str, Any]:
     )
 
 
+def _resolve_log_group_id(ctx: PipelineContext) -> str:
+    """Get logaas_log_group_id for telemetry configuration.
+
+    CRITICAL: Empty string breaks Search API deployment. Must provide a real ID.
+    Sources: bucket creation response, or BFF log-groups endpoint.
+    """
+    if ctx.log_group_id:
+        return ctx.log_group_id
+
+    # Try to get from BFF log-groups (bucket-level)
+    if ctx.tenant_id and ctx.token:
+        status, data = _bff_request(
+            "GET",
+            f"/u-api/s3e-controller/v1/tenants/{ctx.tenant_id}/log-groups",
+            ctx.token,
+        )
+        if status == 200:
+            groups = data if isinstance(data, list) else data.get("items", data.get("log_groups", []))
+            if groups and isinstance(groups, list) and len(groups) > 0:
+                gid = groups[0].get("id") or groups[0].get("log_group_id") or ""
+                if gid:
+                    ctx.log_group_id = gid
+                    return gid
+
+    # Try to get from existing KBs on the project
+    if ctx.project_id:
+        try:
+            status, data = _bff_request(
+                "GET",
+                f"/u-api/managed-rag/user-plane/api/v2/knowledge-bases?project_id={ctx.project_id}&limit=5",
+                ctx.token,
+            )
+            if status == 200:
+                for kb in data.get("knowledgebases", data.get("data", data.get("items", []))):
+                    versions = kb.get("knowledge_base_settings", {}).get("knowledge_base_settings", {})
+                    lgid = versions.get("options", {}).get("logaas_log_group_id", "")
+                    if lgid:
+                        ctx.log_group_id = lgid
+                        return lgid
+        except Exception:
+            pass
+
+    # Fallback: return empty (may break Search API)
+    return ""
+
+
 def _build_kb_payload(ctx: PipelineContext) -> Dict[str, Any]:
     """Build the Knowledge Base creation payload."""
     extensions = [
@@ -961,7 +1005,7 @@ def _build_kb_payload(ctx: PipelineContext) -> Dict[str, Any]:
             },
             "telemetry_configuration": {
                 "logging": {
-                    "logaas_log_group_id": ctx.log_group_id or "",
+                    "logaas_log_group_id": _resolve_log_group_id(ctx),
                 },
             },
             "data_source_configuration": {
