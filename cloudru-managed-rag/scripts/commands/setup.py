@@ -642,9 +642,10 @@ def step_get_tenant_id(ctx: PipelineContext) -> Dict[str, Any]:
 
 
 def step_ensure_bucket(ctx: PipelineContext) -> Dict[str, Any]:
-    """Step 6: Create an S3 bucket if it does not exist (via boto3).
+    """Step 6: Create an S3 bucket via BFF (s3e-controller).
 
-    Uses boto3 with AWS Signature V4 -- NOT rewritten to httpx.
+    Uses BFF endpoint so the bucket is registered in Cloud.ru platform
+    and accessible by Managed RAG for indexing.
     """
     step = "ensure-bucket"
     bucket_name = ctx.bucket_name
@@ -653,9 +654,9 @@ def step_ensure_bucket(ctx: PipelineContext) -> Dict[str, Any]:
         return ctx.record(
             make_error(step, "--bucket-name is required")
         )
-    if not ctx.tenant_id or not ctx.key_id or not ctx.key_secret:
+    if not ctx.tenant_id:
         return ctx.record(
-            make_error(step, "tenant_id, key_id, key_secret required -- run previous steps")
+            make_error(step, "tenant_id required -- run get-tenant-id first")
         )
 
     if ctx.dry_run:
@@ -663,44 +664,24 @@ def step_ensure_bucket(ctx: PipelineContext) -> Dict[str, Any]:
             {"step": step, "bucket_name": bucket_name, "dry_run": True}
         )
 
-    try:
-        import boto3
-        from botocore.config import Config as BotoConfig
-        from botocore.exceptions import ClientError
-    except ImportError:
-        return ctx.record(
-            make_error(step, "boto3 is not installed -- pip install boto3")
-        )
-
-    # IMPORTANT: access_key for S3 is "{tenant_id}:{key_id}"
-    s3_access_key = f"{ctx.tenant_id}:{ctx.key_id}"
-
-    s3 = boto3.client(
-        "s3",
-        endpoint_url=S3_ENDPOINT,
-        region_name=S3_REGION,
-        aws_access_key_id=s3_access_key,
-        aws_secret_access_key=ctx.key_secret,
-        config=BotoConfig(s3={"addressing_style": "path"}),
+    # Create bucket via BFF s3e-controller (registers in platform)
+    status, data = _bff_request(
+        "POST",
+        f"/u-api/s3e-controller/v1/tenants/{ctx.tenant_id}/buckets",
+        ctx.token,
+        body={"name": bucket_name, "storage_class": "STANDARD"},
     )
 
     created = False
-    try:
-        s3.head_bucket(Bucket=bucket_name)
-    except ClientError as exc:
-        error_code = int(exc.response["Error"].get("Code", 0))
-        if error_code == 404:
-            try:
-                s3.create_bucket(Bucket=bucket_name)
-                created = True
-            except ClientError as create_exc:
-                return ctx.record(
-                    make_error(step, f"Failed to create bucket: {create_exc}", None)
-                )
-        else:
-            return ctx.record(
-                make_error(step, f"S3 head_bucket error: {exc}", error_code)
-            )
+    if status in (200, 201):
+        created = True
+    elif status == 409 or (isinstance(data, dict) and "already exists" in str(data).lower()):
+        # Bucket already exists — ok
+        created = False
+    else:
+        return ctx.record(
+            make_error(step, f"Failed to create bucket via BFF: {json.dumps(data)}", status)
+        )
 
     return ctx.record({"step": step, "bucket_name": bucket_name, "created": created})
 
