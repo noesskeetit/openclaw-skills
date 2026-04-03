@@ -927,21 +927,32 @@ def _resolve_log_group_id(ctx: PipelineContext) -> str:
                     ctx.log_group_id = gid
                     return gid
 
-    # Try to get from existing KBs on the project
+    # Try to get from existing KB versions on the project (via SA IAM token)
     if ctx.project_id:
         try:
-            status, data = _bff_request(
-                "GET",
-                f"/u-api/managed-rag/user-plane/api/v2/knowledge-bases?project_id={ctx.project_id}&limit=5",
-                ctx.token,
-            )
-            if status == 200:
-                for kb in data.get("knowledgebases", data.get("data", data.get("items", []))):
-                    versions = kb.get("knowledge_base_settings", {}).get("knowledge_base_settings", {})
-                    lgid = versions.get("options", {}).get("logaas_log_group_id", "")
-                    if lgid:
-                        ctx.log_group_id = lgid
-                        return lgid
+            iam_token = ctx.ensure_iam_token()
+            import httpx
+            with httpx.Client(transport=httpx.HTTPTransport(proxy=None), timeout=15) as c:
+                r = c.get(
+                    f"https://{RAG_API_HOST}/v1/knowledge-bases?project_id={ctx.project_id}&page_size=10",
+                    headers={"Authorization": f"Bearer {iam_token}"},
+                )
+                if r.status_code == 200:
+                    for kb in r.json().get("data", []):
+                        kb_id = kb.get("knowledgebase_id", "")
+                        if not kb_id:
+                            continue
+                        rv = c.get(
+                            f"https://{RAG_API_HOST}/v1/knowledge-bases/versions?knowledgebase_id={kb_id}&project_id={ctx.project_id}&page_size=1",
+                            headers={"Authorization": f"Bearer {iam_token}"},
+                        )
+                        if rv.status_code == 200:
+                            for v in rv.json().get("data", []):
+                                opts = v.get("knowledge_base_version_settings", {}).get("knowledge_base_settings", {}).get("options", {})
+                                lgid = opts.get("logaas_log_group_id", "")
+                                if lgid:
+                                    ctx.log_group_id = lgid
+                                    return lgid
         except Exception:
             pass
 
