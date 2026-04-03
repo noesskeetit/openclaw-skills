@@ -317,6 +317,7 @@ class PipelineContext:
         self.tenant_id: Optional[str] = None
         self.kb_id: Optional[str] = None
         self.search_url: Optional[str] = None
+        self.log_group_id: Optional[str] = None
         self.iam_token: Optional[str] = None
         self.results: List[Dict[str, Any]] = []
 
@@ -665,16 +666,26 @@ def step_ensure_bucket(ctx: PipelineContext) -> Dict[str, Any]:
         )
 
     # Create bucket via BFF s3e-controller (registers in platform)
+    # Match UI payload: global_name, domain_name, quotas, log_group_id
+    bucket_body = {
+        "name": bucket_name,
+        "global_name": bucket_name,
+        "domain_name": bucket_name,
+        "storage_class": "STANDARD",
+        "quotas": [{"type": "BUCKET_SIZE", "value": 10, "unit": "GB"}],
+    }
     status, data = _bff_request(
         "POST",
         f"/u-api/s3e-controller/v1/tenants/{ctx.tenant_id}/buckets",
         ctx.token,
-        body={"name": bucket_name, "storage_class": "STANDARD"},
+        body=bucket_body,
     )
 
     created = False
     if status in (200, 201):
         created = True
+        # Save log_group_id from response for telemetry_configuration in KB
+        ctx.log_group_id = data.get("log_group_id") if isinstance(data, dict) else None
     elif status == 409 or (isinstance(data, dict) and "already exists" in str(data).lower()):
         # Bucket already exists — ok
         created = False
@@ -684,6 +695,114 @@ def step_ensure_bucket(ctx: PipelineContext) -> Dict[str, Any]:
         )
 
     return ctx.record({"step": step, "bucket_name": bucket_name, "created": created})
+
+
+# ---------------------------------------------------------------------------
+# S3 upload via BFF request-signature (project-owned files)
+# ---------------------------------------------------------------------------
+
+
+def _upload_file_via_bff(
+    token: str, bucket_name: str, s3_key: str, local_path: pathlib.Path,
+    tenant_id: str = "",
+) -> None:
+    """Upload a file to S3 using BFF request-signature.
+
+    This ensures files are owned by the project (not an SA), which is required
+    for Managed RAG to read them via Search API.
+
+    Flow:
+      1. Construct AWS4 canonical request for PUT
+      2. POST string_to_sign to BFF → get signature
+      3. PUT file to S3 with signed Authorization header
+    """
+    import hashlib
+
+    file_bytes = local_path.read_bytes()
+    content_type = "application/octet-stream"
+    if local_path.suffix == ".txt":
+        content_type = "text/plain"
+    elif local_path.suffix == ".pdf":
+        content_type = "application/pdf"
+
+    content_length = str(len(file_bytes))
+
+    # Timestamp
+    now = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    date_short = now[:8]
+    scope = f"{date_short}/{S3_REGION}/s3/aws4_request"
+
+    # S3 URL
+    s3_host = "s3.cloud.ru"
+    s3_path = f"/{bucket_name}/{s3_key}"
+    query = "isFileManager=true&x-id=PutObject"
+
+    # Use UNSIGNED-PAYLOAD (matching UI behavior)
+    content_sha = "UNSIGNED-PAYLOAD"
+
+    # Canonical request — match UI signed headers exactly
+    canonical_headers = (
+        f"content-length:{content_length}\n"
+        f"content-type:{content_type}\n"
+        f"host:{s3_host}\n"
+        f"x-amz-content-sha256:{content_sha}\n"
+        f"x-amz-date:{now}\n"
+        f"x-amz-storage-class:STANDARD\n"
+    )
+    signed_headers = "content-length;content-type;host;x-amz-content-sha256;x-amz-date;x-amz-storage-class"
+
+    canonical_request = (
+        f"PUT\n"
+        f"{s3_path}\n"
+        f"{query}\n"
+        f"{canonical_headers}\n"
+        f"{signed_headers}\n"
+        f"{content_sha}"
+    )
+    canonical_hash = hashlib.sha256(canonical_request.encode()).hexdigest()
+
+    string_to_sign = f"AWS4-HMAC-SHA256\n{now}\n{scope}\n{canonical_hash}"
+
+    # Get signature from BFF
+    status, sig_data = _bff_request(
+        "POST",
+        "/u-api/s3e-controller/v2/access/request-signature",
+        token,
+        body={"string_to_sign": string_to_sign},
+    )
+    if status not in (200, 201) or "signature" not in str(sig_data):
+        raise RuntimeError(f"request-signature failed: HTTP {status} {json.dumps(sig_data)}")
+
+    signature = sig_data.get("signature", "")
+    key_id = sig_data.get("key_id", "")
+
+    # Credential = tenant_id:key_id (matching UI Authorization header)
+    credential_id = f"{tenant_id}:{key_id}" if tenant_id else key_id
+    auth_header = (
+        f"AWS4-HMAC-SHA256 "
+        f"Credential={credential_id}/{scope}, "
+        f"SignedHeaders={signed_headers}, "
+        f"Signature={signature}"
+    )
+
+    # PUT to S3
+    s3_url = f"https://{s3_host}{s3_path}?{query}"
+    resp = httpx.put(
+        s3_url,
+        content=file_bytes,
+        headers={
+            "Authorization": auth_header,
+            "Content-Type": content_type,
+            "Content-Length": content_length,
+            "Host": s3_host,
+            "x-amz-content-sha256": content_sha,
+            "x-amz-date": now,
+            "x-amz-storage-class": "STANDARD",
+        },
+        timeout=120,
+    )
+    if resp.status_code not in (200, 201, 204):
+        raise RuntimeError(f"S3 PUT failed: HTTP {resp.status_code} {resp.text[:200]}")
 
 
 def step_upload_docs(ctx: PipelineContext) -> Dict[str, Any]:
@@ -764,10 +883,18 @@ def step_upload_docs(ctx: PipelineContext) -> Dict[str, Any]:
     uploaded = 0
     for fpath in files_to_upload:
         relative = fpath.relative_to(docs_dir)
-        s3_key = f"docs/{relative}"
+        s3_key = str(relative)
         file_size = fpath.stat().st_size
         try:
-            s3.upload_file(str(fpath), bucket_name, s3_key)
+            # ACL=bucket-owner-full-control is CRITICAL:
+            # Without it, Managed RAG Search API cannot read the files
+            s3.upload_file(
+                str(fpath), bucket_name, s3_key,
+                ExtraArgs={
+                    "StorageClass": "STANDARD",
+                    "ACL": "bucket-owner-full-control",
+                },
+            )
             uploaded += 1
             total_size += file_size
         except Exception as exc:
@@ -832,12 +959,19 @@ def _build_kb_payload(ctx: PipelineContext) -> Dict[str, Any]:
                 "model_name": "Qwen/Qwen3-Embedding-0.6B",
                 "model_source": "MODEL_SOURCE_FOUNDATION_MODELS",
             },
+            "telemetry_configuration": {
+                "logging": {
+                    "logaas_log_group_id": ctx.log_group_id or "",
+                },
+            },
             "data_source_configuration": {
                 "cloud_ru_evolution_object_storage_source": {
                     "bucket_name": ctx.bucket_name,
-                    "paths": ["docs/"],
+                    "paths": [""],
                     "object_storage_scan_options": {
+                        "recursive": True,
                         "file_extensions": extensions,
+                        "max_depth": 0,
                     },
                 }
             },
